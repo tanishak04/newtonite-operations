@@ -25,14 +25,25 @@ router = APIRouter(prefix="/items", tags=["work-items"])
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
+from app.core.idempotency import hash_request_payload, check_idempotency, store_idempotency_result
+
 @router.post("", response_model=WorkItemOut, status_code=status.HTTP_201_CREATED)
 async def create_work_item(
     item_in: WorkItemCreate,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     # Enforce team authorization (Member or higher can create items)
     check_team_permission(current_user, item_in.team_id, min_role=RoleEnum.MEMBER)
+
+    route = "/api/v1/items"
+    req_hash = ""
+    if idempotency_key:
+        req_hash = hash_request_payload(route, "POST", item_in.model_dump(mode="json"))
+        cached_response = await check_idempotency(db, idempotency_key, current_user.id, route, req_hash)
+        if cached_response:
+            return cached_response
 
     item_id = str(uuid.uuid4())
     now = utc_now()
@@ -90,6 +101,35 @@ async def create_work_item(
             updated_at=now
         )
         db.add(outbox_job)
+
+    # In the SAME transaction: If Idempotency-Key provided, store key with response
+    if idempotency_key:
+        response_dict = {
+            "id": item_id,
+            "team_id": work_item.team_id,
+            "title": work_item.title,
+            "description": work_item.description,
+            "type": work_item.type.value,
+            "priority": work_item.priority.value,
+            "status": work_item.status.value,
+            "assignee_id": work_item.assignee_id,
+            "assignee": None,
+            "created_by_id": work_item.created_by_id,
+            "creator": {"id": current_user.id, "name": current_user.name, "email": current_user.email},
+            "due_date": work_item.due_date.isoformat() if work_item.due_date else None,
+            "version": work_item.version,
+            "created_at": work_item.created_at.isoformat(),
+            "updated_at": work_item.updated_at.isoformat()
+        }
+        await store_idempotency_result(
+            db=db,
+            key=idempotency_key,
+            user_id=current_user.id,
+            route=route,
+            request_hash=req_hash,
+            status_code=status.HTTP_201_CREATED,
+            response_body=response_dict
+        )
 
     await db.commit()
 
