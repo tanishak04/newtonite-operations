@@ -105,3 +105,49 @@ async def test_workflow_transitions_and_lead_approval():
         })
         assert lead_approve.status_code == 200
         assert lead_approve.json()["status"] == "RESOLVED"
+
+@pytest.mark.asyncio
+async def test_get_activity_endpoint_and_delete():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        lead_token = await get_token(ac, "alice@newtonite.io", "LeadPass123!")
+        member_token = await get_token(ac, "bob@newtonite.io", "MemberPass123!")
+        lead_headers = {"Authorization": f"Bearer {lead_token}"}
+        member_headers = {"Authorization": f"Bearer {member_token}"}
+
+        me_res = await ac.get("/api/v1/auth/me", headers=lead_headers)
+        team_id = me_res.json()["teams"][0]["team_id"]
+
+        # 1. Create item
+        item = (await ac.post("/api/v1/items", headers=lead_headers, json={
+            "team_id": team_id,
+            "title": "Item for testing activity endpoint and deletion",
+            "type": "TASK"
+        })).json()
+        item_id = item["id"]
+
+        # 2. Add comment
+        await ac.post(f"/api/v1/items/{item_id}/comments", headers=member_headers, json={
+            "comment": "Adding comment for activity log verification"
+        })
+
+        # 3. Dedicated GET /items/:id/activity
+        act_res = await ac.get(f"/api/v1/items/{item_id}/activity", headers=member_headers)
+        assert act_res.status_code == 200
+        activities = act_res.json()
+        assert len(activities) >= 2
+        action_types = [a["action_type"] for a in activities]
+        assert "CREATED" in action_types
+        assert "COMMENTED" in action_types
+
+        # 4. Member attempts DELETE -> 403 (Requires Lead)
+        del_member = await ac.delete(f"/api/v1/items/{item_id}", headers=member_headers)
+        assert del_member.status_code == 403
+
+        # 5. Lead attempts DELETE -> 204
+        del_lead = await ac.delete(f"/api/v1/items/{item_id}", headers=lead_headers)
+        assert del_lead.status_code == 204
+
+        # 6. Verify item is deleted
+        get_res = await ac.get(f"/api/v1/items/{item_id}", headers=lead_headers)
+        assert get_res.status_code == 404

@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import random
 from sqlalchemy.future import select
 from app.core.database import engine, Base, AsyncSessionLocal
@@ -10,6 +10,9 @@ from app.models import (
     WorkItem, WorkItemType, Priority, Status,
     ActivityEvent, JobOutbox, OutboxStatus
 )
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 async def init_db():
     async with engine.begin() as conn:
@@ -35,7 +38,7 @@ async def seed_data(item_count: int = 1500):
         ]
         teams = []
         for name, slug in teams_data:
-            t = Team(id=str(uuid.uuid4()), name=name, slug=slug, created_at=datetime.utcnow())
+            t = Team(id=str(uuid.uuid4()), name=name, slug=slug, created_at=utc_now())
             session.add(t)
             teams.append(t)
         await session.flush()
@@ -62,7 +65,7 @@ async def seed_data(item_count: int = 1500):
                 name=name,
                 email=email,
                 password_hash=get_password_hash(pwd),
-                created_at=datetime.utcnow()
+                created_at=utc_now()
             )
             session.add(u)
             users.append(u)
@@ -113,7 +116,7 @@ async def seed_data(item_count: int = 1500):
         activity_batch = []
         outbox_batch = []
 
-        now = datetime.utcnow()
+        now = utc_now()
 
         for i in range(1, item_count + 1):
             team = teams[i % len(teams)]

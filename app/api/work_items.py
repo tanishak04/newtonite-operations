@@ -526,3 +526,60 @@ async def add_comment(
         comment_text=event.comment_text,
         created_at=event.created_at
     )
+
+@router.get("/{item_id}/activity", response_model=List[ActivityEventOut])
+async def get_work_item_activity(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    stmt = select(WorkItem).where(WorkItem.id == item_id)
+    res = await db.execute(stmt)
+    item = res.scalars().first()
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work item not found")
+
+    check_team_permission(current_user, item.team_id, min_role=RoleEnum.VIEWER)
+
+    events_stmt = (
+        select(ActivityEvent)
+        .where(ActivityEvent.work_item_id == item_id)
+        .options(selectinload(ActivityEvent.actor))
+        .order_by(ActivityEvent.created_at.desc())
+    )
+    events_res = await db.execute(events_stmt)
+    events = events_res.scalars().all()
+
+    return [
+        ActivityEventOut(
+            id=e.id,
+            work_item_id=e.work_item_id,
+            actor_id=e.actor_id,
+            actor_name=e.actor.name if e.actor else "System",
+            action_type=e.action_type,
+            old_value=e.old_value,
+            new_value=e.new_value,
+            comment_text=e.comment_text,
+            created_at=e.created_at
+        )
+        for e in events
+    ]
+
+@router.delete("/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_work_item(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    stmt = select(WorkItem).where(WorkItem.id == item_id)
+    res = await db.execute(stmt)
+    item = res.scalars().first()
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work item not found")
+
+    # Deleting work items is restricted to team LEAD or ADMIN
+    check_team_permission(current_user, item.team_id, min_role=RoleEnum.LEAD)
+
+    await db.delete(item)
+    await db.commit()
+    return None

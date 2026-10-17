@@ -1,5 +1,5 @@
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 from sqlalchemy import (
     Column,
@@ -15,6 +15,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from app.core.database import Base
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 class RoleEnum(str, enum.Enum):
     VIEWER = "VIEWER"
@@ -55,7 +58,7 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     name = Column(String(255), nullable=False)
     password_hash = Column(String(255), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     memberships = relationship("Membership", back_populates="user", cascade="all, delete-orphan")
     assigned_items = relationship("WorkItem", foreign_keys="WorkItem.assignee_id", back_populates="assignee")
@@ -67,7 +70,7 @@ class Team(Base):
     id = Column(String(36), primary_key=True)
     name = Column(String(255), unique=True, nullable=False)
     slug = Column(String(100), unique=True, nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     memberships = relationship("Membership", back_populates="team", cascade="all, delete-orphan")
     work_items = relationship("WorkItem", back_populates="team")
@@ -79,7 +82,7 @@ class Membership(Base):
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     team_id = Column(String(36), ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
     role = Column(Enum(RoleEnum), nullable=False, default=RoleEnum.MEMBER)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     user = relationship("User", back_populates="memberships")
     team = relationship("Team", back_populates="memberships")
@@ -106,8 +109,8 @@ class WorkItem(Base):
     # Concurrency control: Optimistic locking
     version = Column(Integer, default=1, nullable=False)
     
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     team = relationship("Team", back_populates="work_items")
     assignee = relationship("User", foreign_keys=[assignee_id], back_populates="assigned_items")
@@ -132,7 +135,7 @@ class ActivityEvent(Base):
     old_value = Column(String(255), nullable=True)
     new_value = Column(String(255), nullable=True)
     comment_text = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
 
     work_item = relationship("WorkItem", back_populates="activity_events")
     actor = relationship("User")
@@ -150,7 +153,7 @@ class IdempotencyKey(Base):
     request_hash = Column(String(64), nullable=False)
     status_code = Column(Integer, nullable=False)
     response_body = Column(JSON, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
 
     __table_args__ = (
         UniqueConstraint("key", "user_id", name="uq_idempotency_key_user"),
@@ -166,8 +169,8 @@ class JobOutbox(Base):
     attempts = Column(Integer, default=0, nullable=False)
     max_attempts = Column(Integer, default=5, nullable=False)
     last_error = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     __table_args__ = (
         Index("ix_job_outbox_status_attempts", "status", "attempts"),
