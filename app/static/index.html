@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Newtonite — Operations Under Pressure</title>
+  <!-- Tailwind CSS CDN for instant, zero-dependency reviewer execution -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    .badge-OPEN { background-color: #dbeafe; color: #1e40af; }
+    .badge-IN_PROGRESS { background-color: #fef3c7; color: #92400e; }
+    .badge-AWAITING_APPROVAL { background-color: #fce7f3; color: #9d174d; }
+    .badge-RESOLVED { background-color: #d1fae5; color: #065f46; }
+    .badge-CLOSED { background-color: #f3f4f6; color: #374151; }
+    .prio-URGENT { color: #dc2626; font-weight: 700; }
+    .prio-HIGH { color: #ea580c; font-weight: 600; }
+    .prio-MEDIUM { color: #2563eb; }
+    .prio-LOW { color: #6b7280; }
+  </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col font-sans">
+
+  <!-- Header -->
+  <header class="bg-slate-800 border-b border-slate-700 px-6 py-4 flex items-center justify-between shadow-md">
+    <div class="flex items-center space-x-3">
+      <div class="bg-indigo-600 text-white p-2 rounded-lg font-bold text-lg">
+        <i class="fa-solid fa-bolt"></i>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold tracking-tight text-white">Newtonite Ops</h1>
+        <p class="text-xs text-slate-400">Operations Under Pressure Platform</p>
+      </div>
+    </div>
+
+    <!-- User Profile & Quick Switcher -->
+    <div id="user-bar" class="flex items-center space-x-4">
+      <div id="logged-in-profile" class="hidden flex items-center space-x-3">
+        <div class="text-right">
+          <p id="user-display-name" class="text-sm font-semibold text-white"></p>
+          <p id="user-display-role" class="text-xs text-indigo-400"></p>
+        </div>
+        <button onclick="logout()" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-xs rounded border border-slate-600">
+          <i class="fa-solid fa-sign-out-alt"></i> Logout
+        </button>
+      </div>
+
+      <!-- Quick Demo Login Switcher -->
+      <div id="demo-login-box" class="flex items-center space-x-2">
+        <select id="demo-user-select" class="bg-slate-700 border border-slate-600 text-xs rounded px-2 py-1.5 text-slate-200">
+          <option value="alice@newtonite.io|LeadPass123!">Alice (Core Lead)</option>
+          <option value="bob@newtonite.io|MemberPass123!">Bob (Core Member)</option>
+          <option value="charlie@newtonite.io|ViewerPass123!">Charlie (Core Viewer)</option>
+          <option value="evan@newtonite.io|LeadPass123!">Evan (Payments Lead)</option>
+        </select>
+        <button onclick="demoLogin()" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold rounded text-white shadow">
+          Switch User
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Notification Toast Container -->
+  <div id="toast-container" class="fixed top-5 right-5 z-50 flex flex-col space-y-2"></div>
+
+  <!-- Main Container -->
+  <main class="flex-1 flex overflow-hidden">
+    <!-- Sidebar: Views & Filters -->
+    <aside class="w-64 bg-slate-800/60 border-r border-slate-700/80 p-4 flex flex-col space-y-6">
+      <!-- Quick Dashboard Views -->
+      <div>
+        <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Attention Views</h2>
+        <nav class="space-y-1">
+          <button onclick="setActiveView('all')" id="view-btn-all" class="w-full text-left px-3 py-2 text-sm rounded-lg bg-indigo-600/20 text-indigo-400 font-medium flex items-center justify-between">
+            <span><i class="fa-solid fa-list mr-2"></i> All Accessible</span>
+          </button>
+          <button onclick="setActiveView('assigned_to_me')" id="view-btn-assigned_to_me" class="w-full text-left px-3 py-2 text-sm rounded-lg hover:bg-slate-700/50 text-slate-300 font-medium flex items-center justify-between">
+            <span><i class="fa-solid fa-user-check mr-2"></i> Assigned to Me</span>
+          </button>
+          <button onclick="setActiveView('unassigned_urgent')" id="view-btn-unassigned_urgent" class="w-full text-left px-3 py-2 text-sm rounded-lg hover:bg-slate-700/50 text-slate-300 font-medium flex items-center justify-between">
+            <span><i class="fa-solid fa-fire text-red-500 mr-2"></i> Unassigned Urgent</span>
+          </button>
+          <button onclick="setActiveView('awaiting_approval')" id="view-btn-awaiting_approval" class="w-full text-left px-3 py-2 text-sm rounded-lg hover:bg-slate-700/50 text-slate-300 font-medium flex items-center justify-between">
+            <span><i class="fa-solid fa-stamp text-amber-500 mr-2"></i> Awaiting Approval</span>
+          </button>
+        </nav>
+      </div>
+
+      <!-- Server-side Filters -->
+      <div class="space-y-4 pt-4 border-t border-slate-700">
+        <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Filters</h2>
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Status</label>
+          <select id="filter-status" onchange="loadWorkItems(true)" class="w-full bg-slate-700 border border-slate-600 rounded text-xs px-2 py-1.5 text-slate-200">
+            <option value="">All Statuses</option>
+            <option value="OPEN">Open</option>
+            <option value="IN_PROGRESS">In Progress</option>
+            <option value="AWAITING_APPROVAL">Awaiting Approval</option>
+            <option value="RESOLVED">Resolved</option>
+            <option value="CLOSED">Closed</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Priority</label>
+          <select id="filter-priority" onchange="loadWorkItems(true)" class="w-full bg-slate-700 border border-slate-600 rounded text-xs px-2 py-1.5 text-slate-200">
+            <option value="">All Priorities</option>
+            <option value="LOW">Low</option>
+            <option value="MEDIUM">Medium</option>
+            <option value="HIGH">High</option>
+            <option value="URGENT">Urgent</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Action Button -->
+      <div class="pt-4 mt-auto">
+        <button onclick="openCreateModal()" class="w-full py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-lg text-sm shadow">
+          <i class="fa-solid fa-plus mr-1"></i> New Work Item
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Content List Area -->
+    <section class="flex-1 flex flex-col p-6 overflow-hidden">
+      <!-- Search & Refresh Bar -->
+      <div class="flex items-center justify-between mb-4 space-x-4">
+        <div class="relative flex-1 max-w-md">
+          <i class="fa-solid fa-magnifying-glass absolute left-3 top-3 text-slate-400 text-sm"></i>
+          <input type="text" id="search-input" placeholder="Search by title or description..." oninput="debounceSearch()" class="w-full bg-slate-800 border border-slate-700 rounded-lg pl-9 pr-4 py-2 text-sm text-slate-200 placeholder-slate-400 focus:outline-none focus:border-indigo-500">
+        </div>
+        <div class="flex items-center space-x-2">
+          <span id="item-stats" class="text-xs text-slate-400"></span>
+          <button onclick="loadWorkItems(true)" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs font-medium">
+            <i class="fa-solid fa-rotate mr-1"></i> Refresh
+          </button>
+        </div>
+      </div>
+
+      <!-- Work Items Table / Feed -->
+      <div class="flex-1 bg-slate-800/40 border border-slate-700/80 rounded-xl overflow-y-auto" id="items-scroll-container">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-slate-800/80 text-xs text-slate-400 uppercase tracking-wider sticky top-0 border-b border-slate-700">
+            <tr>
+              <th class="px-4 py-3">Work Item</th>
+              <th class="px-4 py-3">Type</th>
+              <th class="px-4 py-3">Priority</th>
+              <th class="px-4 py-3">Status</th>
+              <th class="px-4 py-3">Assignee</th>
+              <th class="px-4 py-3">Version</th>
+              <th class="px-4 py-3 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="items-table-body" class="divide-y divide-slate-700/60">
+            <!-- Loaded dynamically -->
+          </tbody>
+        </table>
+        <div id="loading-spinner" class="py-12 text-center text-slate-400 hidden">
+          <i class="fa-solid fa-circle-notch fa-spin text-2xl mb-2 text-indigo-500"></i>
+          <p class="text-xs">Loading operational work items...</p>
+        </div>
+      </div>
+
+      <!-- Pagination Footer -->
+      <div class="mt-4 flex items-center justify-between text-xs text-slate-400">
+        <span id="pagination-status">Showing page results</span>
+        <button id="load-more-btn" onclick="loadNextPage()" class="px-4 py-2 bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 border border-indigo-500/40 rounded-lg hidden font-medium">
+          Load Next Page (Cursor)
+        </button>
+      </div>
+    </section>
+
+    <!-- Right Drawer: Detail View & Activity Timeline -->
+    <aside id="item-detail-drawer" class="w-96 bg-slate-800 border-l border-slate-700 p-6 flex flex-col space-y-4 hidden overflow-y-auto shadow-2xl">
+      <div class="flex items-center justify-between pb-3 border-b border-slate-700">
+        <h3 class="text-base font-bold text-white">Item Detail & Audit</h3>
+        <button onclick="closeDetailDrawer()" class="text-slate-400 hover:text-white">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+      </div>
+
+      <div id="drawer-content" class="space-y-4">
+        <!-- Rendered dynamically -->
+      </div>
+    </aside>
+  </main>
+
+  <!-- Create Work Item Modal -->
+  <div id="create-modal" class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center hidden z-50">
+    <div class="bg-slate-800 border border-slate-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
+      <div class="flex items-center justify-between mb-4 pb-2 border-b border-slate-700">
+        <h3 class="font-bold text-white text-base">New Operational Work Item</h3>
+        <button onclick="closeCreateModal()" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+
+      <form id="create-form" onsubmit="handleCreateItem(event)" class="space-y-3">
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Title</label>
+          <input type="text" id="new-title" required class="w-full bg-slate-700 border border-slate-600 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-indigo-500">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Description</label>
+          <textarea id="new-description" rows="3" class="w-full bg-slate-700 border border-slate-600 rounded px-3 py-1.5 text-sm text-white focus:outline-none focus:border-indigo-500"></textarea>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Type</label>
+            <select id="new-type" class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1.5 text-xs text-white">
+              <option value="INCIDENT">INCIDENT</option>
+              <option value="CUSTOMER_ISSUE">CUSTOMER_ISSUE</option>
+              <option value="PAYMENT">PAYMENT</option>
+              <option value="COMPLIANCE">COMPLIANCE</option>
+              <option value="TASK" selected>TASK</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Priority</label>
+            <select id="new-priority" class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1.5 text-xs text-white">
+              <option value="LOW">LOW</option>
+              <option value="MEDIUM" selected>MEDIUM</option>
+              <option value="HIGH">HIGH</option>
+              <option value="URGENT">URGENT</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="pt-4 flex justify-end space-x-2">
+          <button type="button" onclick="closeCreateModal()" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-xs font-semibold">Cancel</button>
+          <button type="submit" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-semibold">Create Item</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
