@@ -294,6 +294,158 @@ async def transition_work_item_status(
     res = await db.execute(stmt)
     return res.scalars().first()
 
+@router.post("/{item_id}/claim", response_model=WorkItemOut)
+async def claim_work_item(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Verify work item exists and check user's team permissions
+    stmt = select(WorkItem).where(WorkItem.id == item_id)
+    res = await db.execute(stmt)
+    item = res.scalars().first()
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work item not found")
+
+    check_team_permission(current_user, item.team_id, min_role=RoleEnum.MEMBER)
+
+    # CRITICAL BEHAVIOUR 1: ATOMIC CLAIM UNDER CONCURRENCY
+    # Conditional atomic update: Only update if assignee_id IS NULL
+    # This prevents race conditions where two users claim simultaneously.
+    now = utc_now()
+    claim_stmt = (
+        update(WorkItem)
+        .where(and_(WorkItem.id == item_id, WorkItem.assignee_id.is_(None)))
+        .values(
+            assignee_id=current_user.id,
+            version=WorkItem.version + 1,
+            updated_at=now
+        )
+    )
+    result = await db.execute(claim_stmt)
+    if result.rowcount == 0:
+        # 0 rows updated means another concurrent request already claimed this item!
+        # Re-fetch latest to give helpful feedback
+        refreshed = (await db.execute(select(WorkItem).where(WorkItem.id == item_id).options(selectinload(WorkItem.assignee)))).scalars().first()
+        assignee_name = refreshed.assignee.name if refreshed and refreshed.assignee else "another user"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Conflict: This work item has already been claimed by {assignee_name}"
+        )
+
+    # In the SAME database transaction: Append audit event and create outbox job
+    audit_event = ActivityEvent(
+        id=str(uuid.uuid4()),
+        work_item_id=item_id,
+        actor_id=current_user.id,
+        action_type="CLAIMED",
+        old_value=None,
+        new_value=current_user.name,
+        comment_text=f"Claimed by {current_user.name}",
+        created_at=now
+    )
+    db.add(audit_event)
+
+    outbox_job = JobOutbox(
+        id=str(uuid.uuid4()),
+        job_type="NOTIFY_ASSIGNEE",
+        payload={"work_item_id": item_id, "assignee_id": current_user.id, "assignee_name": current_user.name},
+        status=OutboxStatus.PENDING,
+        created_at=now,
+        updated_at=now
+    )
+    db.add(outbox_job)
+
+    await db.commit()
+
+    # Re-fetch with relationships loaded
+    stmt = (
+        select(WorkItem)
+        .where(WorkItem.id == item_id)
+        .options(selectinload(WorkItem.assignee), selectinload(WorkItem.creator))
+    )
+    res = await db.execute(stmt)
+    return res.scalars().first()
+
+@router.patch("/{item_id}", response_model=WorkItemOut)
+async def update_work_item(
+    item_id: str,
+    update_in: WorkItemUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    stmt = select(WorkItem).where(WorkItem.id == item_id)
+    res = await db.execute(stmt)
+    item = res.scalars().first()
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work item not found")
+
+    check_team_permission(current_user, item.team_id, min_role=RoleEnum.MEMBER)
+
+    # CRITICAL BEHAVIOUR 2: OPTIMISTIC LOCKING
+    # Update only if WHERE version = update_in.version.
+    # If version changed in the database, reject stale edit with 409 Conflict.
+    values_to_update = {
+        "version": WorkItem.version + 1,
+        "updated_at": utc_now()
+    }
+    changes = []
+    if update_in.title is not None and update_in.title != item.title:
+        values_to_update["title"] = update_in.title
+        changes.append(f"Title changed from '{item.title}' to '{update_in.title}'")
+    if update_in.description is not None and update_in.description != item.description:
+        values_to_update["description"] = update_in.description
+        changes.append("Description updated")
+    if update_in.priority is not None and update_in.priority != item.priority:
+        values_to_update["priority"] = update_in.priority
+        changes.append(f"Priority changed from {item.priority.value} to {update_in.priority.value}")
+    if update_in.due_date is not None and update_in.due_date != item.due_date:
+        values_to_update["due_date"] = update_in.due_date
+        changes.append("Due date updated")
+
+    now = utc_now()
+    opt_stmt = (
+        update(WorkItem)
+        .where(and_(WorkItem.id == item_id, WorkItem.version == update_in.version))
+        .values(**values_to_update)
+    )
+    result = await db.execute(opt_stmt)
+    if result.rowcount == 0:
+        # Re-fetch latest version to send back to client
+        latest = (await db.execute(select(WorkItem).where(WorkItem.id == item_id))).scalars().first()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "Stale edit rejected: This item was modified by another user.",
+                "current_version": latest.version if latest else None,
+                "submitted_version": update_in.version
+            }
+        )
+
+    # Log audit event in SAME transaction
+    for ch in changes:
+        audit_event = ActivityEvent(
+            id=str(uuid.uuid4()),
+            work_item_id=item_id,
+            actor_id=current_user.id,
+            action_type="UPDATED",
+            old_value=None,
+            new_value=None,
+            comment_text=ch,
+            created_at=now
+        )
+        db.add(audit_event)
+
+    await db.commit()
+
+    stmt = (
+        select(WorkItem)
+        .where(WorkItem.id == item_id)
+        .options(selectinload(WorkItem.assignee), selectinload(WorkItem.creator))
+    )
+    res = await db.execute(stmt)
+    return res.scalars().first()
+
 @router.post("/{item_id}/comments", response_model=ActivityEventOut)
 async def add_comment(
     item_id: str,
