@@ -144,3 +144,95 @@ async def test_idempotency_key_payload_mismatch_returns_400():
         data2 = res2.json()
         assert "Idempotency Key reuse error" in data2["detail"]
         assert "previously used with a different request payload" in data2["detail"]
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_requests_with_same_key_race():
+    """
+    Test requirement:
+    Concurrent duplicate requests with identical Idempotency-Key and payload:
+    Exactly one executes the creation, the concurrent sibling safely recovers and returns
+    the cached response without duplicate records or unhandled 500 errors.
+    """
+    import asyncio
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        token = await get_token(ac, "alice@newtonite.io", "LeadPass123!")
+        headers_base = {"Authorization": f"Bearer {token}"}
+        me_res = await ac.get("/api/v1/auth/me", headers=headers_base)
+        team_id = me_res.json()["teams"][0]["team_id"]
+
+        unique_key = f"concurrent-idempotency-{uuid.uuid4()}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Idempotency-Key": unique_key
+        }
+
+        payload = {
+            "team_id": team_id,
+            "title": "Concurrent duplicate request item",
+            "type": "INCIDENT",
+            "priority": "HIGH"
+        }
+
+        # Fire two concurrent POST requests with the same key and payload
+        res1, res2 = await asyncio.gather(
+            ac.post("/api/v1/items", headers=headers, json=payload),
+            ac.post("/api/v1/items", headers=headers, json=payload)
+        )
+
+        assert res1.status_code == 201
+        assert res2.status_code == 201
+        d1 = res1.json()
+        d2 = res2.json()
+
+        # Both return the exact same item ID
+        assert d1["id"] == d2["id"]
+        assert d1["title"] == payload["title"]
+
+        # Verify only one database record was created
+        async with AsyncSessionLocal() as session:
+            count = await session.scalar(
+                select(func.count(WorkItem.id)).where(WorkItem.id == d1["id"])
+            )
+            assert count == 1
+
+@pytest.mark.asyncio
+async def test_idempotency_key_cross_user_ownership_theft_rejected():
+    """
+    Test requirement:
+    Idempotency key ownership: User B attempting to reuse a key created by User A
+    is rejected with 403 Forbidden.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        alice_token = await get_token(ac, "alice@newtonite.io", "LeadPass123!")
+        bob_token = await get_token(ac, "bob@newtonite.io", "MemberPass123!")
+
+        alice_hdr_base = {"Authorization": f"Bearer {alice_token}"}
+        me_res = await ac.get("/api/v1/auth/me", headers=alice_hdr_base)
+        team_id = me_res.json()["teams"][0]["team_id"]
+
+        shared_key = f"theft-test-key-{uuid.uuid4()}"
+
+        # 1. Alice creates item with key
+        res_alice = await ac.post("/api/v1/items", headers={
+            "Authorization": f"Bearer {alice_token}",
+            "Idempotency-Key": shared_key
+        }, json={
+            "team_id": team_id,
+            "title": "Alice legitimate request",
+            "type": "TASK"
+        })
+        assert res_alice.status_code == 201
+
+        # 2. Bob attempts to reuse Alice's key -> MUST FAIL with 403 Forbidden
+        res_bob = await ac.post("/api/v1/items", headers={
+            "Authorization": f"Bearer {bob_token}",
+            "Idempotency-Key": shared_key
+        }, json={
+            "team_id": team_id,
+            "title": "Bob attempting key theft",
+            "type": "TASK"
+        })
+        assert res_bob.status_code == 403
+        assert "Idempotency key is owned by another user" in res_bob.json()["detail"]

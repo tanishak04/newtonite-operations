@@ -25,14 +25,16 @@ async def check_idempotency(
       - If request_hash matches, returns the cached JSONResponse.
       - If request_hash differs, raises 400 Bad Request (key reused with different parameters).
     """
-    stmt = select(IdempotencyKey).where(
-        IdempotencyKey.key == key,
-        IdempotencyKey.user_id == user_id
-    )
+    stmt = select(IdempotencyKey).where(IdempotencyKey.key == key)
     res = await db.execute(stmt)
     record = res.scalars().first()
 
     if record:
+        if record.user_id != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Idempotency key is owned by another user."
+            )
         if record.request_hash != request_hash:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
