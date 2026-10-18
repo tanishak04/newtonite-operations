@@ -145,3 +145,102 @@ async def test_terminal_state_rejection():
         })
         assert illegal_transition.status_code == 400
         assert "Invalid state transition from CLOSED" in illegal_transition.json()["detail"]
+
+        # 4. Attempting to claim a CLOSED item -> MUST FAIL 400
+        claim_closed = await ac.post(f"/api/v1/items/{item_id}/claim", headers=headers)
+        assert claim_closed.status_code == 400
+        assert "Cannot claim a closed work item" in claim_closed.json()["detail"]
+
+        # 5. Attempting to update a CLOSED item -> MUST FAIL 400
+        update_closed = await ac.patch(f"/api/v1/items/{item_id}", headers=headers, json={
+            "title": "Modifying closed item",
+            "version": close_res.json()["version"]
+        })
+        assert update_closed.status_code == 400
+        assert "Cannot modify a closed work item" in update_closed.json()["detail"]
+
+@pytest.mark.asyncio
+async def test_viewer_role_comment_rejection():
+    """
+    Test requirement:
+    Viewer role restriction: Charlie (Viewer) has read-only access and cannot post comments.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        lead_token = await get_token(ac, "alice@newtonite.io", "LeadPass123!")
+        viewer_token = await get_token(ac, "charlie@newtonite.io", "ViewerPass123!")
+        lead_hdr = {"Authorization": f"Bearer {lead_token}"}
+        viewer_hdr = {"Authorization": f"Bearer {viewer_token}"}
+
+        me_res = (await ac.get("/api/v1/auth/me", headers=lead_hdr)).json()
+        team_id = me_res["teams"][0]["team_id"]
+
+        item = (await ac.post("/api/v1/items", headers=lead_hdr, json={
+            "team_id": team_id,
+            "title": "Item for viewer comment restriction check",
+            "type": "TASK"
+        })).json()
+
+        # Viewer attempts to add comment -> 403 Forbidden
+        res = await ac.post(f"/api/v1/items/{item['id']}/comments", headers=viewer_hdr, json={
+            "comment": "Unauthorized viewer comment attempt"
+        })
+        assert res.status_code == 403
+        assert "requires MEMBER role" in res.json()["detail"]
+
+@pytest.mark.asyncio
+async def test_cross_team_activity_history_forbidden():
+    """
+    Test requirement:
+    Activity history scoping: User from another team (Evan) cannot access Core Platform activity history.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        alice_token = await get_token(ac, "alice@newtonite.io", "LeadPass123!")
+        evan_token = await get_token(ac, "evan@newtonite.io", "LeadPass123!")
+        alice_hdr = {"Authorization": f"Bearer {alice_token}"}
+        evan_hdr = {"Authorization": f"Bearer {evan_token}"}
+
+        me_alice = (await ac.get("/api/v1/auth/me", headers=alice_hdr)).json()
+        core_team_id = me_alice["teams"][0]["team_id"]
+
+        item = (await ac.post("/api/v1/items", headers=alice_hdr, json={
+            "team_id": core_team_id,
+            "title": "Core audit history isolation test",
+            "type": "TASK"
+        })).json()
+
+        # Evan requests activity history of Alice's team item -> 403 Forbidden
+        act_res = await ac.get(f"/api/v1/items/{item['id']}/activity", headers=evan_hdr)
+        assert act_res.status_code == 403
+        assert "Access denied: you are not a member of team" in act_res.json()["detail"]
+
+@pytest.mark.asyncio
+async def test_cross_team_assignee_creation_rejected():
+    """
+    Test requirement:
+    Assignment validation: Attempting to assign an item to a user who does not belong
+    to the target team is rejected with 400 Bad Request.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        alice_token = await get_token(ac, "alice@newtonite.io", "LeadPass123!")
+        evan_token = await get_token(ac, "evan@newtonite.io", "LeadPass123!")
+        alice_hdr = {"Authorization": f"Bearer {alice_token}"}
+        evan_hdr = {"Authorization": f"Bearer {evan_token}"}
+
+        me_alice = (await ac.get("/api/v1/auth/me", headers=alice_hdr)).json()
+        me_evan = (await ac.get("/api/v1/auth/me", headers=evan_hdr)).json()
+
+        core_team_id = me_alice["teams"][0]["team_id"]
+        evan_user_id = me_evan["id"]  # Evan is only in Payments & Billing
+
+        # Alice attempts to create a Core item assigned to Evan (cross-team user)
+        res = await ac.post("/api/v1/items", headers=alice_hdr, json={
+            "team_id": core_team_id,
+            "title": "Invalid cross-team assignment attempt",
+            "type": "TASK",
+            "assignee_id": evan_user_id
+        })
+        assert res.status_code == 400
+        assert "is not a member of team" in res.json()["detail"]

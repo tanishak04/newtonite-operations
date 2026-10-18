@@ -13,7 +13,7 @@ from app.core.workflow import validate_transition
 from app.models import (
     User, Team, Membership, RoleEnum,
     WorkItem, WorkItemType, Priority, Status,
-    ActivityEvent, JobOutbox, OutboxStatus
+    ActivityEvent, JobOutbox, OutboxStatus, IdempotencyKey
 )
 from app.schemas.work_item import (
     WorkItemCreate, WorkItemUpdate, WorkItemTransition, WorkItemComment,
@@ -102,6 +102,20 @@ async def create_work_item(
         )
         db.add(outbox_job)
 
+    # If assignee specified, verify assignee is an active member of this team
+    if item_in.assignee_id:
+        assignee_membership = await db.execute(
+            select(Membership).where(
+                Membership.user_id == item_in.assignee_id,
+                Membership.team_id == item_in.team_id
+            )
+        )
+        if not assignee_membership.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Assignee '{item_in.assignee_id}' is not a member of team '{item_in.team_id}'"
+            )
+
     # In the SAME transaction: If Idempotency-Key provided, store key with response
     if idempotency_key:
         response_dict = {
@@ -131,7 +145,35 @@ async def create_work_item(
             response_body=response_dict
         )
 
-    await db.commit()
+    from fastapi.responses import JSONResponse
+    creator_user_id = str(current_user.id)
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        # Handle concurrent race condition where two requests with same key commit concurrently
+        if idempotency_key:
+            stmt = select(IdempotencyKey).where(IdempotencyKey.key == idempotency_key)
+            res = await db.execute(stmt)
+            existing_record = res.scalars().first()
+            if existing_record:
+                if existing_record.user_id != creator_user_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Access denied: Idempotency key is owned by another user."
+                    )
+                if existing_record.request_hash == req_hash:
+                    return JSONResponse(
+                        status_code=existing_record.status_code,
+                        content=existing_record.response_body,
+                        headers={"X-Idempotent-Replay": "true"}
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Idempotency Key reuse error: Key was previously used with a different request payload."
+                    )
+        raise exc
 
     # Re-fetch with relationships loaded
     stmt = (
@@ -193,11 +235,21 @@ async def list_work_items(
         )
         query = query.where(search_filter)
 
-    # Cursor-based keyset pagination (ordered by created_at DESC, id DESC)
+    # Cursor-based keyset pagination (ordered by created_at DESC, id DESC) with deterministic tie-breaking
     if cursor:
         try:
-            cursor_dt = datetime.fromisoformat(cursor)
-            query = query.where(WorkItem.created_at < cursor_dt)
+            if "|" in cursor:
+                cursor_ts_str, cursor_id = cursor.split("|", 1)
+                cursor_dt = datetime.fromisoformat(cursor_ts_str)
+                query = query.where(
+                    or_(
+                        WorkItem.created_at < cursor_dt,
+                        and_(WorkItem.created_at == cursor_dt, WorkItem.id < cursor_id)
+                    )
+                )
+            else:
+                cursor_dt = datetime.fromisoformat(cursor)
+                query = query.where(WorkItem.created_at < cursor_dt)
         except Exception:
             pass
 
@@ -210,7 +262,8 @@ async def list_work_items(
 
     next_cursor = None
     if has_more and items_to_return:
-        next_cursor = items_to_return[-1].created_at.isoformat()
+        last_item = items_to_return[-1]
+        next_cursor = f"{last_item.created_at.isoformat()}|{last_item.id}"
 
     return PaginatedWorkItemsOut(
         items=items_to_return,
@@ -349,6 +402,13 @@ async def claim_work_item(
 
     check_team_permission(current_user, item.team_id, min_role=RoleEnum.MEMBER)
 
+    # Closed status is terminal; claiming is disallowed
+    if item.status == Status.CLOSED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot claim a closed work item. Closed status is terminal."
+        )
+
     # CRITICAL BEHAVIOUR 1: ATOMIC CLAIM UNDER CONCURRENCY
     # Conditional atomic update: Only update if assignee_id IS NULL
     # This prevents race conditions where two users claim simultaneously.
@@ -421,6 +481,13 @@ async def update_work_item(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work item not found")
 
     check_team_permission(current_user, item.team_id, min_role=RoleEnum.MEMBER)
+
+    # Closed status is terminal; updates are disallowed
+    if item.status == Status.CLOSED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot modify a closed work item. Closed status is terminal."
+        )
 
     # CRITICAL BEHAVIOUR 2: OPTIMISTIC LOCKING
     # Update only if WHERE version = update_in.version.
@@ -499,7 +566,7 @@ async def add_comment(
     if not item:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work item not found")
 
-    check_team_permission(current_user, item.team_id, min_role=RoleEnum.VIEWER)
+    check_team_permission(current_user, item.team_id, min_role=RoleEnum.MEMBER)
 
     now = utc_now()
     event = ActivityEvent(
