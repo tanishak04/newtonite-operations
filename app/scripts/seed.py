@@ -14,9 +14,15 @@ from app.models import (
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
+def run_migrations():
+    from alembic.config import Config
+    from alembic import command
+    alembic_cfg = Config("alembic.ini")
+    command.upgrade(alembic_cfg, "head")
+
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, run_migrations)
 
 async def seed_data(item_count: int = 1500):
     await init_db()

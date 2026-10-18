@@ -30,13 +30,16 @@ This document details the architectural decisions, trade-offs, and design ration
 
 ---
 
-### Decision 3: Reliable Asynchronous Processing (Transactional Outbox Pattern)
+### Decision 3: Reliable Asynchronous Processing (Transactional Outbox Pattern & Backoff)
 - **Context:** State changes (e.g. assigning a high-priority incident) require downstream actions (notifications, webhooks) without blocking API response times or suffering from dual-write inconsistencies.
 - **Options Considered:**
   1. *Direct HTTP/Queue Dispatch inside API handler*: Calls external service or queue directly before returning.
   2. *External Message Broker (Kafka / RabbitMQ / Redis)*: Pushing events to an external queue.
-  3. *Transactional Outbox Table*: Storing pending jobs in `job_outbox` in the database transaction, processed by an async worker loop.
-- **Choice & Implementation:** Transactional Outbox Table. When an item is claimed or created, a `job_outbox` record is inserted with `status = PENDING`. A dedicated worker (`app/worker.py`) polls and executes jobs with idempotent handlers, exponential retry logic, and an attempt cap before marking permanently `FAILED`.
+  3. *Transactional Outbox Table with Bounded Backoff*: Storing pending jobs in `job_outbox` in the database transaction, processed by an async worker loop with exponential backoff and duplicate suppression.
+- **Choice & Implementation:** Transactional Outbox Table. When an item is claimed or created, a `job_outbox` record is inserted with `status = PENDING`. A dedicated worker (`app/worker.py`) polls and executes jobs with:
+  - Bounded exponential backoff: retry delays grow as $T = \min(60\text{s}, 2^{\text{attempts}})$, preventing downstream thundering herd problems.
+  - Hard attempt caps: jobs that fail consecutively reach a permanent terminal `FAILED` state after `max_attempts` (default 5).
+  - Idempotent handler dispatch: side-effect tracking guarantees that reprocessing an already-completed job never duplicates outgoing notifications.
 - **Trade-off:** Guarantees "at-least-once" delivery without requiring external broker infrastructure (Redis/Kafka) in the core reviewer setup.
 
 ---
@@ -62,10 +65,29 @@ This document details the architectural decisions, trade-offs, and design ration
 
 ---
 
+### Decision 6: Schema Migration Strategy (Alembic Async Migrations vs Declarative DDL)
+- **Context:** Schema evolution must be repeatable, version-controlled, and consistent across both local development (SQLite `aiosqlite`) and containerized production (PostgreSQL `asyncpg`).
+- **Options Considered:**
+  1. *Ad-hoc Declarative DDL (`create_all`)*: Quick to start, but fails to track schema version history or support forward/backward schema evolutions in production.
+  2. *Alembic Asynchronous Migrations*: Official SQLAlchemy migration framework configured with async engine support and auto-version tracking.
+- **Choice & Implementation:** Alembic Asynchronous Migrations. We configured `migrations/env.py` with dynamic database URL resolution from `settings.DATABASE_URL` and bound it to `Base.metadata`. Seed scripts and container startup execute `alembic upgrade head` before ingesting data, unifying the schema path across all environments.
+- **Trade-off:** Slightly more initial boilerplate than `create_all`, but guarantees production-grade schema predictability, zero schema drift, and support for automated CI migration checks (`alembic check`).
+
+---
+
 ### What We Chose Not to Build (Deliberate Scope Boundaries)
 1. **SSO / SAML / Email Verification:** A seeded user table with pre-configured passwords allows reviewers to verify all 4 role permission boundaries in seconds without signing up.
 2. **WebSocket Infrastructure:** HTTP cursor polling was chosen over WebSockets to avoid maintaining sticky socket connections and stateful proxy infrastructure, while TanStack/vanilla fetch patterns provide identical user responsiveness.
 3. **File Attachments & Blobs:** S3/GCS bucket integrations were omitted to maintain a 100% self-contained codebase that starts with a single command.
+
+---
+
+### What I Would Build Next Week
+1. **Real-time Server-Sent Events (SSE):** Push outbox updates and status changes directly to active operator dashboards without client polling.
+2. **Lead Reassignment & Delegation:** Add dedicated manager workflows for cross-assigning items between team members with mandatory audit remarks.
+3. **CDC Outbox Dispatcher:** Connect Debezium or PostgreSQL logical replication to feed jobs directly into Kafka or Redis BullMQ for sub-millisecond async notifications.
+4. **Diagnostic Attachments:** Add S3/GCS presigned upload URLs for attaching logs and incident screenshots directly to work item audit trails.
+5. **Role Delegation & Multi-team Leads:** Allow managers to temporarily delegate lead approval authority during shift handovers.
 
 ---
 

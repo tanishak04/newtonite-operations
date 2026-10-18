@@ -103,3 +103,44 @@ async def test_transactional_activity_history_integrity():
         assert "CREATED" in action_types
         assert "COMMENTED" in action_types
         assert "STATUS_CHANGED" in action_types
+
+@pytest.mark.asyncio
+async def test_idempotency_key_payload_mismatch_returns_400():
+    """
+    Test requirement:
+    Idempotency key reuse with a different payload returns HTTP 400 Bad Request error.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        token = await get_token(ac, "alice@newtonite.io", "LeadPass123!")
+        me_res = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+        team_id = me_res.json()["teams"][0]["team_id"]
+
+        unique_key = f"idempotency-mismatch-test-{uuid.uuid4()}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Idempotency-Key": unique_key
+        }
+
+        # 1. First request with payload A -> 201 Created
+        payload_a = {
+            "team_id": team_id,
+            "title": "First payload for idempotency key",
+            "type": "TASK",
+            "priority": "LOW"
+        }
+        res1 = await ac.post("/api/v1/items", headers=headers, json=payload_a)
+        assert res1.status_code == 201
+
+        # 2. Second request with SAME key but DIFFERENT payload B -> 400 Bad Request
+        payload_b = {
+            "team_id": team_id,
+            "title": "Different payload trying to reuse key",
+            "type": "INCIDENT",
+            "priority": "URGENT"
+        }
+        res2 = await ac.post("/api/v1/items", headers=headers, json=payload_b)
+        assert res2.status_code == 400
+        data2 = res2.json()
+        assert "Idempotency Key reuse error" in data2["detail"]
+        assert "previously used with a different request payload" in data2["detail"]

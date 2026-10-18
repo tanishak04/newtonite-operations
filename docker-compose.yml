@@ -34,5 +34,23 @@ services:
       db:
         condition: service_healthy
 
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newtonite-worker
+    restart: always
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgrespassword@db:5432/newtonite_ops
+      SECRET_KEY: test-secret-key-production-ready-32-chars-long
+      OUTBOX_POLL_INTERVAL_SECONDS: 2
+      OUTBOX_MAX_RETRIES: 5
+    depends_on:
+      db:
+        condition: service_healthy
+      app:
+        condition: service_started
+
 volumes:
   postgres_data:

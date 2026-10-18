@@ -104,3 +104,125 @@ async def test_transactional_outbox_processing_and_retries():
         assert f_record.status == OutboxStatus.FAILED
         assert f_record.attempts == 2
         assert "Simulated external notification service failure" in f_record.last_error
+
+@pytest.mark.asyncio
+async def test_outbox_bounded_retry_backoff_and_exhaustion():
+    """
+    Test requirement:
+    Verify failure followed by bounded backoff retry, and final terminal failure.
+    Uses time injection to verify backoff windows deterministically without arbitrary sleeps.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    async with AsyncSessionLocal() as session:
+        job_id = str(uuid.uuid4())
+        job = JobOutbox(
+            id=job_id,
+            job_type="NOTIFY_ASSIGNEE",
+            payload={"work_item_id": "item-retry-test", "should_fail": True},
+            status=OutboxStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        session.add(job)
+        await session.commit()
+
+        t0 = datetime.now(timezone.utc)
+
+        # 1. Initial attempt at t0: Fails attempt 1 -> attempts=1, backoff required = 2^1 = 2 seconds
+        count = await process_outbox_batch(db=session, job_ids=[job_id], current_time=t0)
+        assert count == 0
+        j1 = (await session.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j1.status == OutboxStatus.PENDING
+        assert j1.attempts == 1
+
+        # 2. Premature retry attempt at t0 + 1 second (cooldown is 2s): MUST BE SKIPPED
+        t_premature = t0 + timedelta(seconds=1)
+        count_premature = await process_outbox_batch(db=session, job_ids=[job_id], current_time=t_premature)
+        assert count_premature == 0
+        j_premature = (await session.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j_premature.attempts == 1  # Unchanged, skipped due to backoff
+
+        # 3. Valid retry at t0 + 3 seconds: Fails attempt 2 -> attempts=2, backoff required = 2^2 = 4 seconds
+        t_retry1 = t0 + timedelta(seconds=3)
+        await process_outbox_batch(db=session, job_ids=[job_id], current_time=t_retry1)
+        j2 = (await session.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j2.status == OutboxStatus.PENDING
+        assert j2.attempts == 2
+
+        # 4. Final attempt at t0 + 10 seconds: Fails attempt 3 -> reaches max_attempts (3) -> terminal FAILED
+        t_final = t0 + timedelta(seconds=10)
+        await process_outbox_batch(db=session, job_ids=[job_id], current_time=t_final)
+        j3 = (await session.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j3.status == OutboxStatus.FAILED
+        assert j3.attempts == 3
+
+        # 5. Subsequent execution loop at t0 + 20s must permanently skip this exhausted job
+        t_after = t0 + timedelta(seconds=20)
+        await process_outbox_batch(db=session, job_ids=[job_id], current_time=t_after)
+        j4 = (await session.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j4.status == OutboxStatus.FAILED
+        assert j4.attempts == 3
+
+@pytest.mark.asyncio
+async def test_outbox_duplicate_processing_idempotency():
+    """
+    Test requirement:
+    Duplicate processing of a completed job does not re-execute or duplicate side-effects,
+    relying strictly on persisted database state across worker restarts (when in-memory registers are empty).
+    """
+    from app.worker import PROCESSED_DISPATCHES, reset_dispatches, handle_job_payload
+    reset_dispatches()
+
+    job_id = str(uuid.uuid4())
+
+    # Step 1: Initial job creation and execution
+    async with AsyncSessionLocal() as session1:
+        job = JobOutbox(
+            id=job_id,
+            job_type="NOTIFY_ASSIGNEE",
+            payload={"work_item_id": "item-idempotent-dispatch", "assignee_id": "alice"},
+            status=OutboxStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        session1.add(job)
+        await session1.commit()
+
+        # First execution -> succeeds and transitions status to COMPLETED in database
+        count1 = await process_outbox_batch(db=session1, job_ids=[job_id])
+        assert count1 == 1
+
+        j1 = (await session1.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j1.status == OutboxStatus.COMPLETED
+        assert j1.attempts == 1
+
+    # Step 2: SIMULATE WORKER RESTART
+    # Wipe all in-memory tracking registers completely to simulate a fresh process restart
+    reset_dispatches()
+    assert len(PROCESSED_DISPATCHES) == 0
+
+    # Step 3: Reprocess using a completely new database session and empty in-memory state
+    async with AsyncSessionLocal() as session2:
+        # A. Normal worker polling query: COMPLETED jobs are never selected for processing
+        stmt_poll = select(JobOutbox).where(
+            JobOutbox.status.in_([OutboxStatus.PENDING, OutboxStatus.PROCESSING]),
+            JobOutbox.id == job_id
+        )
+        res_poll = await session2.execute(stmt_poll)
+        assert res_poll.scalars().first() is None  # Excluded by persistent status filter
+
+        # B. Even if explicitly requested by job_id, worker checks persisted status in DB and skips
+        count2 = await process_outbox_batch(db=session2, job_ids=[job_id])
+        assert count2 == 0  # 0 jobs processed
+
+        # C. Verify database record remained unchanged
+        j2 = (await session2.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j2.status == OutboxStatus.COMPLETED
+        assert j2.attempts == 1  # Attempts was NOT incremented
+
+        # D. Direct handle_job_payload call with db session checks persisted status in DB
+        res_direct = await handle_job_payload(j2.job_type, j2.payload, job_id=job_id, db=session2)
+        assert res_direct is True
+        # In-memory register was never populated because it exited early on database check
+        assert job_id not in PROCESSED_DISPATCHES
