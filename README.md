@@ -114,20 +114,20 @@ The test suite runs with **100% test isolation**. A session fixture in `tests/co
 pytest -v
 ```
 
-### Critical Behaviours Tested (19/19 Passing):
-1. `tests/test_concurrency.py`: Parallel atomic claim race conditions (`200` vs `409 Conflict`) and stale update rejection with optimistic locking.
-2. `tests/test_idempotency.py`: Replayed `Idempotency-Key` network retries returning cached responses without duplicate rows, payload mismatch rejection (`400 Bad Request`), and strict single-transaction audit history.
-3. `tests/test_edge_cases.py`: Cross-team data access isolation (`403 Forbidden`), Viewer write denial, and terminal status lifecycle protection (`CLOSED`).
-4. `tests/test_outbox_and_pagination.py`: Server-side cursor pagination across 1,000+ items, bounded exponential retry backoff, attempt caps with terminal failure, and duplicate processing idempotency.
-5. `tests/test_work_items.py`: Workflow state machine with Lead approval constraints, dedicated activity timeline endpoint, and item deletion authorization.
-6. `tests/test_auth.py`: Token authentication and team role memberships.
+### Critical Behaviours Tested (27/27 Passing):
+1. `tests/test_concurrency.py`: Parallel atomic claim race conditions (`200` vs `409 Conflict`) and stale update rejection with optimistic locking (`409 Conflict`).
+2. `tests/test_idempotency.py`: Replayed `Idempotency-Key` network retries returning cached responses without duplicate rows, payload mismatch rejection (`400 Bad Request`), concurrent duplicate request race recovery on commit collisions, and cross-user key theft prevention (`403 Forbidden`).
+3. `tests/test_edge_cases.py`: Cross-team data access isolation (`403 Forbidden`), Viewer write denial on create, claim, update, and comment (`403 Forbidden`), terminal status lifecycle protection (`CLOSED` immunity against transitions, claims, and edits), cross-team activity log isolation, and cross-team assignee validation (`400 Bad Request`).
+4. `tests/test_outbox_and_pagination.py`: Server-side composite cursor pagination across 1,000+ items with deterministic tie-breaking `(created_at, id)`, bounded exponential retry backoff, attempt caps with terminal failure, duplicate processing idempotency across worker restarts, multi-worker safe claiming with compare-and-swap, and abandoned worker crash recovery.
+5. `tests/test_work_items.py`: Workflow state machine with Lead approval constraints (`AWAITING_APPROVAL -> RESOLVED`), dedicated activity timeline endpoint, and item deletion authorization.
+6. `tests/test_auth.py`: Token authentication, invalid credentials rejection, and team role memberships.
 
 ---
 
 ## Known Limitations
-- Real-time client updates currently use refetch/polling rather than WebSockets.
-- Email delivery in the background outbox worker is simulated through structured logging and an in-memory dispatch register.
-- SSO / SAML integration is omitted in favor of lightweight token auth.
+- **Real-time Push:** Client updates currently use server-side filtered refetch/polling rather than WebSockets or SSE.
+- **Outbox Side-Effect Boundary:** The transactional outbox guarantees durable at-least-once processing, bounded retries, and database deduplication. External notification dispatch (email/webhook) is simulated via structured logging; exactly-once delivery end-to-end requires downstream providers to support idempotency tokens.
+- **SSO / Enterprise Auth:** SSO/SAML integration is omitted in favor of lightweight JWT token auth with seeded team roles.
 
 ---
 

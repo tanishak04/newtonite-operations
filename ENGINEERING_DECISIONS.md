@@ -30,37 +30,45 @@ This document details the architectural decisions, trade-offs, and design ration
 
 ---
 
-### Decision 3: Reliable Asynchronous Processing (Transactional Outbox Pattern & Backoff)
+### Decision 3: Reliable Asynchronous Processing (Transactional Outbox Pattern & Multi-Worker Safety)
 - **Context:** State changes (e.g. assigning a high-priority incident) require downstream actions (notifications, webhooks) without blocking API response times or suffering from dual-write inconsistencies.
 - **Options Considered:**
   1. *Direct HTTP/Queue Dispatch inside API handler*: Calls external service or queue directly before returning.
   2. *External Message Broker (Kafka / RabbitMQ / Redis)*: Pushing events to an external queue.
-  3. *Transactional Outbox Table with Bounded Backoff*: Storing pending jobs in `job_outbox` in the database transaction, processed by an async worker loop with exponential backoff and duplicate suppression.
+  3. *Transactional Outbox Table with Bounded Backoff & CAS Claiming*: Storing pending jobs in `job_outbox` in the database transaction, processed by an async worker loop with atomic compare-and-swap claiming, exponential backoff, and crash recovery.
 - **Choice & Implementation:** Transactional Outbox Table. When an item is claimed or created, a `job_outbox` record is inserted with `status = PENDING`. A dedicated worker (`app/worker.py`) polls and executes jobs with:
-  - Bounded exponential backoff: retry delays grow as $T = \min(60\text{s}, 2^{\text{attempts}})$, preventing downstream thundering herd problems.
-  - Hard attempt caps: jobs that fail consecutively reach a permanent terminal `FAILED` state after `max_attempts` (default 5).
-  - Idempotent handler dispatch: side-effect tracking guarantees that reprocessing an already-completed job never duplicates outgoing notifications.
-- **Trade-off:** Guarantees "at-least-once" delivery without requiring external broker infrastructure (Redis/Kafka) in the core reviewer setup.
+  - **Multi-Worker CAS Claiming:** Atomically claims jobs via `UPDATE job_outbox SET status = 'PROCESSING', attempts = attempts + 1 WHERE id = :id AND status IN ('PENDING', 'PROCESSING') AND attempts = :attempts`. If two workers poll simultaneously, exactly one succeeds; the other gracefully skips.
+  - **Worker Crash Recovery:** Abandoned jobs stuck in `PROCESSING` longer than `stale_timeout_seconds` (e.g., due to worker power loss or container SIGKILL) are safely reclaimed and retried.
+  - **Bounded exponential backoff:** retry delays grow as $T = \min(60\text{s}, 2^{\text{attempts}})$, preventing downstream thundering herd problems.
+  - **Hard attempt caps:** jobs that fail consecutively reach a permanent terminal `FAILED` state after `max_attempts` (default 5).
+  - **Side-Effect Delivery Boundary:** The outbox provides durable "at-least-once" delivery with persistent database status checking. Downstream systems must support idempotent consumer keys or deduplication tokens for end-to-end effectively exactly-once semantics.
+- **Trade-off:** Guarantees durable "at-least-once" delivery and safe multi-worker execution without requiring external broker infrastructure (Redis/Kafka) in the core reviewer setup.
 
 ---
 
-### Decision 4: Pagination & Scale Strategy (Cursor/Keyset vs Offset)
-- **Context:** The system must comfortably handle tens of thousands of work items and high concurrent write volumes.
+### Decision 4: Pagination & Scale Strategy (Composite Keyset Cursor with Tie-Breaking)
+- **Context:** The system must comfortably handle tens of thousands of work items and high concurrent write volumes without missing records or degrading query response times.
 - **Options Considered:**
   1. *Offset Pagination (`OFFSET 1000 LIMIT 25`)*: Traditional page-based approach.
-  2. *Cursor/Keyset Pagination (`WHERE (created_at, id) < (cursor_created_at, cursor_id)`)*: Keyset-based pagination.
-- **Choice & Implementation:** Cursor/Keyset Pagination ordered by `(created_at DESC, id DESC)`. Composite indexes `(team_id, status)`, `(team_id, priority)`, and `(team_id, created_at)` were configured.
-- **Trade-off:** Offset pagination degrades to $O(N)$ query scans on large tables and suffers from "page drift" when items are inserted in real time. Keyset pagination ensures $O(1)$ index seek performance and stable feeds.
+  2. *Single-column Cursor (`WHERE created_at < cursor`)*: Loses records when multiple items share identical timestamps.
+  3. *Composite Keyset Cursor (`WHERE (created_at < cursor_dt) OR (created_at == cursor_dt AND id < cursor_id)`)*: Deterministic keyset-based pagination.
+- **Choice & Implementation:** Composite Keyset Cursor Pagination ordered by `(created_at DESC, id DESC)` with cursor encoding `timestamp|id`. Composite indexes `(team_id, status)`, `(team_id, priority)`, and `(team_id, created_at)` were configured.
+- **Trade-off:** Keyset pagination ensures stable $O(1)$ index seek performance and prevents record skips or duplicates across page boundaries even when bulk ingestion produces identical creation timestamps.
 
 ---
 
-### Decision 5: Team-Scoped Role-Based Access Control (Server-Enforced RBAC)
+### Decision 5: Team-Scoped Role-Based Access Control (Server-Enforced RBAC & Terminal State Immunity)
 - **Context:** Work items often belong to sensitive domains (e.g., Compliance, Payments). Team members must not be able to view, claim, or resolve items outside their department.
 - **Options Considered:**
   1. *Frontend-only filtering*: Hiding unauthorized buttons and lists in the UI.
   2. *Global Roles*: Admin vs User globally across all records.
   3. *Team-Scoped Granular RBAC*: Scoped permissions per `(user, team_id, role)` enforced at the API layer.
-- **Choice & Implementation:** Team-Scoped Granular RBAC (`VIEWER`, `MEMBER`, `LEAD`, `ADMIN`). Every endpoint invokes `check_team_permission` before reading or mutating data. Approving items (`AWAITING_APPROVAL -> RESOLVED`) strictly requires `LEAD` role or higher.
+- **Choice & Implementation:** Team-Scoped Granular RBAC (`VIEWER`, `MEMBER`, `LEAD`, `ADMIN`):
+  - Every endpoint invokes `check_team_permission` before reading or mutating data (`403 Forbidden` on cross-team access).
+  - Approving items (`AWAITING_APPROVAL -> RESOLVED`) strictly requires `LEAD` role or higher.
+  - `VIEWER` role is strictly read-only: forbidden from creating items, claiming, updating, transitioning, and posting comments.
+  - Assignee validation enforces that assignees belong to the work item's team on creation (`400 Bad Request` on cross-team assignment).
+  - Terminal state `CLOSED` is strictly immutable: further transitions, claims, and field edits are rejected with `400 Bad Request`.
 - **Trade-off:** Requires explicit membership management, but provides ironclad multitenant security and prevents unauthorized actions even if API endpoints are called directly.
 
 ---
@@ -72,6 +80,21 @@ This document details the architectural decisions, trade-offs, and design ration
   2. *Alembic Asynchronous Migrations*: Official SQLAlchemy migration framework configured with async engine support and auto-version tracking.
 - **Choice & Implementation:** Alembic Asynchronous Migrations. We configured `migrations/env.py` with dynamic database URL resolution from `settings.DATABASE_URL` and bound it to `Base.metadata`. Seed scripts and container startup execute `alembic upgrade head` before ingesting data, unifying the schema path across all environments.
 - **Trade-off:** Slightly more initial boilerplate than `create_all`, but guarantees production-grade schema predictability, zero schema drift, and support for automated CI migration checks (`alembic check`).
+
+---
+
+### Decision 7: API Idempotency & Key Ownership Scoping
+- **Context:** Network retries, mobile disconnects, and double-clicking submission buttons can cause duplicate transactions and corrupted operational records.
+- **Options Considered:**
+  1. *Client-side button disabling only*: Unreliable under network timeouts or direct API calls.
+  2. *In-memory deduplication cache*: Lost on server restarts and fails across multiple API instances.
+  3. *Database-Backed Idempotency Keys with Request Hashing & Ownership Scoping*: Storing key, payload hash, status code, and response body in an ACID table.
+- **Choice & Implementation:** Database-Backed Idempotency Key table (`idempotency_keys`):
+  - Repeated identical requests return the cached response with `X-Idempotent-Replay: true`.
+  - Reusing a key with a modified payload is rejected with `400 Bad Request`.
+  - Keys are scoped to the authenticated owner; unauthorized cross-user key reuse is rejected with `403 Forbidden`.
+  - Concurrent duplicate race conditions are caught at database commit, safely rolling back and returning the winning sibling's cached response.
+- **Trade-off:** Requires a database write alongside business record insertion, but eliminates duplicate records with zero chance of inconsistent phantom items.
 
 ---
 
