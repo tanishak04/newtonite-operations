@@ -37,8 +37,8 @@ flowchart TD
 ### Using Docker Compose (Recommended)
 ```bash
 # Clone the repository
-git clone https://github.com/tanishak04/newtonite-operations.git
-cd newtonite-operations
+git clone https://github.com/tanishak04/newtonite-ops-2300971530130.git
+cd newtonite-ops-2300971530130
 
 # Start Postgres, FastAPI app, and transactional Outbox Worker
 docker compose up --build
