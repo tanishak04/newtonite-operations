@@ -226,3 +226,138 @@ async def test_outbox_duplicate_processing_idempotency():
         assert res_direct is True
         # In-memory register was never populated because it exited early on database check
         assert job_id not in PROCESSED_DISPATCHES
+
+@pytest.mark.asyncio
+async def test_concurrent_multi_worker_claim_safety():
+    """
+    Test requirement:
+    Jobs are claimed safely when multiple worker instances operate concurrently.
+    Two workers polling the same pending job in parallel: exactly one worker succeeds
+    in claiming and executing, preventing duplicate dispatches.
+    """
+    import asyncio
+    job_id = str(uuid.uuid4())
+
+    async with AsyncSessionLocal() as setup_session:
+        job = JobOutbox(
+            id=job_id,
+            job_type="NOTIFY_ASSIGNEE",
+            payload={"work_item_id": "item-concurrency-outbox", "assignee_id": "bob"},
+            status=OutboxStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        setup_session.add(job)
+        await setup_session.commit()
+
+    # Simulate two independent worker instances polling the same job concurrently
+    async def run_worker_instance():
+        async with AsyncSessionLocal() as session:
+            return await process_outbox_batch(limit=5, db=session, job_ids=[job_id])
+
+    results = await asyncio.gather(run_worker_instance(), run_worker_instance())
+
+    # Exactly one worker processed the job (sum of processed counts is 1)
+    assert sum(results) == 1
+    assert 1 in results
+    assert 0 in results
+
+    # Verify final state in database
+    async with AsyncSessionLocal() as verify_session:
+        j = (await verify_session.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j.status == OutboxStatus.COMPLETED
+        assert j.attempts == 1
+
+@pytest.mark.asyncio
+async def test_outbox_worker_crash_recovery_abandoned_processing():
+    """
+    Test requirement:
+    Crash recovery: A job left in PROCESSING state after a worker crash / restart
+    is safely reclaimed and completed after exceeding the stale processing timeout.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    job_id = str(uuid.uuid4())
+    t_past = datetime.now(timezone.utc) - timedelta(seconds=600)
+
+    # Insert a job stuck in PROCESSING from 600s ago (simulating a dead crashed worker)
+    async with AsyncSessionLocal() as setup_session:
+        job = JobOutbox(
+            id=job_id,
+            job_type="NOTIFY_ASSIGNEE",
+            payload={"work_item_id": "item-crashed-recovery", "assignee_id": "charlie"},
+            status=OutboxStatus.PROCESSING,
+            attempts=1,
+            max_attempts=3,
+            created_at=t_past,
+            updated_at=t_past
+        )
+        setup_session.add(job)
+        await setup_session.commit()
+
+    # Worker runs with stale_timeout_seconds=300 (job has been abandoned for 600s)
+    async with AsyncSessionLocal() as worker_session:
+        count = await process_outbox_batch(limit=5, db=worker_session, job_ids=[job_id], stale_timeout_seconds=300.0)
+        assert count == 1
+
+        # Verify the abandoned job was recovered and completed
+        j = (await worker_session.execute(select(JobOutbox).where(JobOutbox.id == job_id))).scalars().first()
+        assert j.status == OutboxStatus.COMPLETED
+        assert j.attempts == 2
+
+@pytest.mark.asyncio
+async def test_cursor_pagination_deterministic_tie_breaking():
+    """
+    Test requirement:
+    Cursor pagination has deterministic ordering and handles ties correctly.
+    Multiple work items with identical created_at timestamps are paginated
+    using composite (created_at, id) keyset cursor without skipping or duplicating items.
+    """
+    from datetime import datetime, timezone
+    from app.models import WorkItem, WorkItemType, Priority, Status
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        token = await get_token(ac, "alice@newtonite.io", "LeadPass123!")
+        headers = {"Authorization": f"Bearer {token}"}
+        me_res = await ac.get("/api/v1/auth/me", headers=headers)
+        team_id = me_res.json()["teams"][0]["team_id"]
+        user_id = me_res.json()["id"]
+
+        # Insert 3 work items with the EXACT SAME created_at timestamp
+        identical_ts = datetime(2025, 6, 15, 10, 30, 0, tzinfo=timezone.utc)
+        test_ids = [str(uuid.uuid4()) for _ in range(3)]
+        test_ids.sort(reverse=True)  # Sort descending so we know expected order
+
+        async with AsyncSessionLocal() as db:
+            for idx, item_id in enumerate(test_ids):
+                item = WorkItem(
+                    id=item_id,
+                    team_id=team_id,
+                    title=f"Tie-breaking test item {idx}",
+                    type=WorkItemType.TASK,
+                    priority=Priority.MEDIUM,
+                    status=Status.OPEN,
+                    created_by_id=user_id,
+                    created_at=identical_ts,
+                    updated_at=identical_ts,
+                    version=1
+                )
+                db.add(item)
+            await db.commit()
+
+        # Page 1 with limit=1
+        res1 = await ac.get(f"/api/v1/items?team_id={team_id}&limit=1&status=OPEN", headers=headers)
+        assert res1.status_code == 200
+        data1 = res1.json()
+        assert len(data1["items"]) == 1
+        first_cursor = data1["next_cursor"]
+        assert first_cursor is not None
+        assert "|" in first_cursor
+
+        # Page 2 with limit=1 using composite cursor
+        res2 = await ac.get(f"/api/v1/items?team_id={team_id}&limit=1&status=OPEN&cursor={first_cursor}", headers=headers)
+        assert res2.status_code == 200
+        data2 = res2.json()
+        assert len(data2["items"]) == 1
+        assert data2["items"][0]["id"] != data1["items"][0]["id"]

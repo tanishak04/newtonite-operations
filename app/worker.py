@@ -89,11 +89,13 @@ async def process_outbox_batch(
     job_ids: Optional[List[str]] = None,
     current_time: Optional[datetime] = None,
     base_backoff: float = 2.0,
-    max_backoff: float = 60.0
+    max_backoff: float = 60.0,
+    stale_timeout_seconds: float = 300.0
 ) -> int:
     """
     Pulls a batch of PENDING or retryable jobs, executes them with exponential backoff,
-    and updates job status atomically.
+    and updates job status atomically using compare-and-swap claiming for multi-worker safety.
+    Supports crash recovery for abandoned jobs stuck in PROCESSING longer than stale_timeout_seconds.
     Supports time injection (current_time) for deterministic, sleep-free testing.
     """
     should_close_session = False
@@ -105,13 +107,12 @@ async def process_outbox_batch(
     now = current_time or datetime.now(timezone.utc)
 
     try:
-        # Fetch pending/processing jobs that have not exceeded max_attempts
+        # Fetch candidate jobs
         conditions = [
             JobOutbox.status.in_([OutboxStatus.PENDING, OutboxStatus.PROCESSING]),
             JobOutbox.attempts < JobOutbox.max_attempts
         ]
         if job_ids:
-            # When job_ids are explicitly provided, allow checking COMPLETED jobs to verify idempotency
             conditions = [
                 JobOutbox.id.in_(job_ids)
             ]
@@ -136,20 +137,59 @@ async def process_outbox_batch(
                 logger.warning(f"Job {job.id} has reached terminal failure or max attempts. Skipping.")
                 continue
 
+            # Crash recovery check for jobs in PROCESSING state:
+            # If a job is PROCESSING, only claim it if it has been abandoned longer than stale_timeout_seconds
+            if job.status == OutboxStatus.PROCESSING:
+                job_updated = job.updated_at or job.created_at
+                if job_updated.tzinfo is None and now.tzinfo is not None:
+                    job_updated = job_updated.replace(tzinfo=timezone.utc)
+                elif job_updated.tzinfo is not None and now.tzinfo is None:
+                    now = now.replace(tzinfo=timezone.utc)
+                if (now - job_updated).total_seconds() < stale_timeout_seconds:
+                    # Job is actively being processed by another worker; do not touch
+                    continue
+                logger.warning(f"Job {job.id} was abandoned in PROCESSING state for >{stale_timeout_seconds}s. Reclaiming for crash recovery.")
+
             # Bounded exponential backoff check
             if not is_job_ready(job, now, base_backoff=base_backoff, max_backoff=max_backoff):
                 logger.info(f"Job {job.id} is waiting for backoff cooldown. Skipping.")
                 continue
 
-            job.status = OutboxStatus.PROCESSING
-            job.attempts += 1
-            job.updated_at = now
+            # Multi-Worker Safety: Atomic Compare-And-Swap (CAS) Claim
+            # Atomically claim the job only if status and attempts match the candidate state.
+            # If two workers attempt to claim the same job concurrently, exactly one will update 1 row.
+            claim_stmt = (
+                update(JobOutbox)
+                .where(
+                    and_(
+                        JobOutbox.id == job.id,
+                        JobOutbox.status.in_([OutboxStatus.PENDING, OutboxStatus.PROCESSING]),
+                        JobOutbox.attempts == job.attempts
+                    )
+                )
+                .values(
+                    status=OutboxStatus.PROCESSING,
+                    attempts=JobOutbox.attempts + 1,
+                    updated_at=now
+                )
+            )
+            claim_res = await db.execute(claim_stmt)
+            if claim_res.rowcount == 0:
+                # Another concurrent worker already claimed this job; gracefully skip
+                logger.info(f"Job {job.id} was already claimed by another worker. Skipping.")
+                continue
             await db.commit()
 
+            # Refresh job instance from database to load the atomically updated attempts and status
+            await db.refresh(job)
+
+            # Execute the idempotent job side effect
             try:
                 await handle_job_payload(job.job_type, job.payload, job_id=job.id, db=db)
                 job.status = OutboxStatus.COMPLETED
                 job.last_error = None
+                job.updated_at = now
+                await db.commit()
                 processed_count += 1
             except Exception as exc:
                 job.last_error = str(exc)
@@ -159,9 +199,8 @@ async def process_outbox_batch(
                 else:
                     job.status = OutboxStatus.PENDING
                     logger.warning(f"Job {job.id} failed attempt {job.attempts}/{job.max_attempts}. Will retry.")
-
-            job.updated_at = now
-            await db.commit()
+                job.updated_at = now
+                await db.commit()
 
     finally:
         if should_close_session:
